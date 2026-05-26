@@ -1,0 +1,25 @@
+# Python Dependencies for LED Brightness Random Forest Training
+
+# Core ML Libraries
+numpy>=1.21.0
+pandas>=1.3.0
+scikit-learn>=1.0.0
+
+# Model persistence
+pickle5>=0.0.11
+
+# For Arduino/ESP32 libraries (install via Arduino IDE):
+# - WiFi (built-in ESP32)
+# - WebServer (built-in ESP32)
+# - SPIFFS (built-in ESP32)
+# - Wire (built-in)
+# - RTClib (install via Library Manager)
+# - ArduinoJson (install via Library Manager - version 6.x)
+
+# Optional: For advanced analysis
+matplotlib>=3.4.0
+seaborn>=0.11.0
+
+# Optional: For Jupyter notebooks
+jupyter>=1.0.0
+ipython>=7.0.0
