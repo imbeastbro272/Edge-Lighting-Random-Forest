@@ -118,6 +118,12 @@ int manual_offset = 0;
 unsigned long last_update = 0;
 
 // ============================================================================
+// MODE CONTROL
+// ============================================================================
+
+bool manual_mode = false;  // false = AUTO mode, true = MANUAL mode
+
+// ============================================================================
 // RETRAINING STATE
 // ============================================================================
 
@@ -587,6 +593,11 @@ void handleSerialCommand() {
     Serial.println(F("stats         - Show statistics"));
     Serial.println(F("retrain       - Force retraining"));
     Serial.println(F(""));
+    Serial.println(F("=== MODE CONTROL ==="));
+    Serial.println(F("auto          - Switch to AUTO mode (with retraining)"));
+    Serial.println(F("manual        - Switch to MANUAL mode (validation only)"));
+    Serial.println(F("mode          - Show current mode"));
+    Serial.println(F(""));
     Serial.println(F("=== SAMPLE MANAGEMENT ==="));
     Serial.println(F("samples       - View training samples"));
     Serial.println(F("clearsamples  - Clear all samples"));
@@ -606,8 +617,51 @@ void handleSerialCommand() {
     Serial.println(F("Example: test 22 1 300 1 2200"));
     Serial.println(F("         (10 PM, Tuesday, 300 lux, motion, pot=2200)"));
   }
+  else if (command == "auto") {
+    manual_mode = false;
+    Serial.println(F(""));
+    Serial.println(F("========================================"));
+    Serial.println(F("    SWITCHED TO AUTO MODE"));
+    Serial.println(F("========================================"));
+    Serial.println(F("  - Live sensor readings"));
+    Serial.println(F("  - ML predictions active"));
+    Serial.println(F("  - Potentiometer adjustments captured"));
+    Serial.println(F("  - Automatic retraining enabled"));
+    Serial.println(F("========================================"));
+    Serial.println(F(""));
+  }
+  else if (command == "manual") {
+    manual_mode = true;
+    Serial.println(F(""));
+    Serial.println(F("========================================"));
+    Serial.println(F("    SWITCHED TO MANUAL MODE"));
+    Serial.println(F("========================================"));
+    Serial.println(F("  - Use 'test' command for validation"));
+    Serial.println(F("  - No automatic updates"));
+    Serial.println(F("  - No retraining"));
+    Serial.println(F("  - LED controlled manually via pot"));
+    Serial.println(F(""));
+    Serial.println(F("Try: test 22 1 300 1 2048"));
+    Serial.println(F("========================================"));
+    Serial.println(F(""));
+  }
+  else if (command == "mode") {
+    Serial.println(F(""));
+    Serial.println(F("=== CURRENT MODE ==="));
+    Serial.print(F("Mode: "));
+    Serial.println(manual_mode ? F("MANUAL (Validation/Testing)") : F("AUTO (Live with Retraining)"));
+    Serial.print(F("Model: "));
+    Serial.println(use_adaptive_model ? F("ADAPTIVE (Learned)") : F("RANDOM FOREST (Original)"));
+    Serial.print(F("Training Samples: "));
+    Serial.println(training_sample_count);
+    Serial.print(F("Predictions Made: "));
+    Serial.println(prediction_count);
+    Serial.println(F(""));
+  }
   else if (command == "stats") {
     Serial.println(F("=== STATISTICS ==="));
+    Serial.print(F("Mode: "));
+    Serial.println(manual_mode ? F("MANUAL") : F("AUTO"));
     Serial.print(F("Predictions: "));
     Serial.println(prediction_count);
     Serial.print(F("Average Brightness: "));
@@ -768,9 +822,18 @@ void setup() {
   Serial.println(F("Real-time sample collection"));
   Serial.println(F("Gradient descent retraining"));
   Serial.println(F("Persistent model storage"));
+  Serial.println(F("AUTO/MANUAL mode switching"));
   
+  Serial.println(F(""));
+  Serial.println(F("=== MODES ==="));
+  Serial.println(F("AUTO   - Live predictions + retraining"));
+  Serial.println(F("MANUAL - Validation testing only"));
+  Serial.println(F(""));
+  Serial.println(F("Current Mode: AUTO (type 'manual' to switch)"));
+  
+  Serial.println(F(""));
   Serial.println(F("=== Commands ==="));
-  Serial.println(F("help, stats, retrain, samples"));
+  Serial.println(F("help, auto, manual, mode, stats, test, retrain"));
   
   Serial.println(F("=== Monitoring Started ==="));
 }
@@ -782,7 +845,13 @@ void setup() {
 void loop() {
   unsigned long current_time = millis();
   
-  if (current_time - last_update >= UPDATE_INTERVAL) {
+  // Handle Serial commands (always active in both modes)
+  if (Serial.available()) {
+    handleSerialCommand();
+  }
+  
+  // AUTO MODE: Live updates with retraining
+  if (!manual_mode && current_time - last_update >= UPDATE_INTERVAL) {
     last_update = current_time;
     
     DateTime now = rtc.now();
@@ -863,7 +932,19 @@ void loop() {
     checkScheduledRetraining(now);
   }
   
-  if (Serial.available()) {
-    handleSerialCommand();
+  // MANUAL MODE: Only potentiometer control, no automatic updates
+  else if (manual_mode) {
+    // In manual mode, LED is controlled directly by potentiometer
+    // No ML predictions, no automatic updates, no retraining
+    manual_offset = readManualOffset();
+    
+    // Map pot value directly to brightness (0-100%)
+    int pot_value = analogRead(POT_PIN);
+    int manual_brightness = map(pot_value, 0, 4095, 0, 100);
+    int pwm_value = map(manual_brightness, 0, 100, 0, 255);
+    ledcWrite(LED_PIN, pwm_value);
+    
+    // Small delay to prevent overwhelming serial output
+    delay(100);
   }
 }
