@@ -120,9 +120,8 @@ void setup() {
   pinMode(PIN_MOTION_SENSOR, INPUT);
   pinMode(PIN_LIGHT_SENSOR, INPUT);
   
-  // Setup PWM for LED
-  ledcSetup(PWM_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
-  ledcAttachPin(PIN_LED_PWM, PWM_CHANNEL);
+  // Setup PWM for LED (using new ESP32 v3.x API)
+  ledcAttach(PIN_LED_PWM, PWM_FREQUENCY, PWM_RESOLUTION);
   
   // Initialize SPIFFS
   if (!SPIFFS.begin(true)) {
@@ -278,7 +277,7 @@ void makePrediction() {
 void setBrightness(int brightness_percent) {
   // Convert percentage to PWM value (0-255)
   int pwm_value = map(brightness_percent, 0, 100, 0, 255);
-  ledcWrite(PWM_CHANNEL, pwm_value);
+  ledcWrite(PIN_LED_PWM, pwm_value);
   
   Serial.printf("LED Brightness set to: %d%% (PWM: %d)\n", 
                 brightness_percent, pwm_value);
@@ -463,7 +462,7 @@ void setupWebServer() {
 }
 
 void handleRoot() {
-  String html = R"(
+  String html = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
@@ -487,7 +486,7 @@ void handleRoot() {
 </head>
 <body>
   <div class="container">
-    <h1>🔆 Adaptive Lighting Control</h1>
+    <h1>Adaptive Lighting Control</h1>
     
     <div class="status">
       <h2>Current Status</h2>
@@ -501,8 +500,8 @@ void handleRoot() {
     <div class="status">
       <h2>Feedback</h2>
       <p>Is the brightness correct?</p>
-      <button class="btn-accept" onclick="sendFeedback('accept')">✓ Accept</button>
-      <button class="btn-reject" onclick="sendFeedback('reject')">✗ Adjust</button>
+      <button class="btn-accept" onclick="sendFeedback('accept')">Accept</button>
+      <button class="btn-reject" onclick="sendFeedback('reject')">Adjust</button>
     </div>
     
     <div class="status">
@@ -521,7 +520,7 @@ void handleRoot() {
     </div>
     
     <div style="text-align: center; margin-top: 20px;">
-      <button class="btn-manual" onclick="exportData()">📥 Export Learning Data</button>
+      <button class="btn-manual" onclick="exportData()">Export Learning Data</button>
     </div>
   </div>
   
@@ -578,7 +577,7 @@ void handleRoot() {
   </script>
 </body>
 </html>
-  )";
+)rawliteral";
   
   server.send(200, "text/html", html);
 }
