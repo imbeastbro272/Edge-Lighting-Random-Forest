@@ -64,6 +64,7 @@
 #include <EEPROM.h>
 #include <math.h>
 #include "led_rf_model.h"
+#include "utility_agent.h"   // NON-ML AI layer (advisory by default)
 
 // ============================================
 // PIN DEFINITIONS
@@ -189,6 +190,16 @@ int  last_check_day            = -1;
 
 unsigned long prediction_count = 0;
 float avg_brightness           = 0;
+
+// ============================================
+// NON-ML AI LAYER (Utility-Based Agent) - state
+// Kept entirely separate from the RF-KNN pipeline. Config lives in RAM
+// (see utility_agent.h); the EEPROM layout used by RF-KNN is NOT touched.
+// ============================================
+
+UtilityResult g_util_result = { false };
+float util_prev_brightness  = 0.0f;
+bool  util_apply            = false;   // false = advisory only (RF-KNN drives LED)
 
 // ============================================
 // FORWARD DECLARATIONS
@@ -621,12 +632,14 @@ void setup() {
   Serial.println(F("=== MODEL ==="));
   Serial.println(F("Base       : Random Forest (50 trees, frozen)"));
   Serial.println(F("Personalize: KNN, gated by same day-of-week + minute window"));
+  Serial.println(F("AI layer   : Utility-based agent (non-ML), advisory by default"));
 
   Serial.println(F("=== Commands ==="));
   Serial.println(F("help, stats, samples, clearsamples, modelinfo, knninfo, resetmodel"));
   Serial.println(F("setk N | setsigma X | setwindow N"));
   Serial.println(F("addsample HH [MM] DD AMBIENT MOTION BRIGHTNESS"));
   Serial.println(F("test      HH [MM] DD AMBIENT MOTION POT"));
+  Serial.println(F("utility | utilon | utiloff | setutil C E M [F]  (non-ML AI layer)"));
 
   Serial.println(F("=== Monitoring Started ==="));
   Serial.println(F("|   Time   | Day | Hour | Ambient | Motion |   RF  |  Adj | Elig |  ML% | Off | Final% | PWM |"));
@@ -663,9 +676,19 @@ void loop() {
       &rf_pred, &correction, &confidence, &min_dist,
       &neighbors_used, &eligible_count);
 
+    // --- Non-ML AI layer: Utility-Based Agent (advisory by default) ---
+    // Reads the SAME inputs and uses RF-KNN's output purely as the comfort
+    // anchor. It NEVER alters predict_knn(). When util_apply == false (the
+    // default) ai_brightness == ml_brightness, so LED behavior is identical
+    // to the RF-KNN-only build. Toggle with `utilon` / `utiloff`.
+    utilityAgentEvaluate(ml_brightness, util_prev_brightness,
+                         smoothed_ldr, motion_detected, hour, &g_util_result);
+    float ai_brightness  = util_apply ? g_util_result.recommended : ml_brightness;
+    util_prev_brightness = ai_brightness;
+
     manual_offset = readManualOffset();
 
-    float final_brightness = ml_brightness + manual_offset;
+    float final_brightness = ai_brightness + manual_offset;
     if (final_brightness < 0)   final_brightness = 0;
     if (final_brightness > 100) final_brightness = 100;
 
@@ -974,6 +997,12 @@ void cmdHelp() {
   Serial.println(F("test HH DD AMBIENT MOTION POT"));
   Serial.println(F("test HH MM DD AMBIENT MOTION POT"));
   Serial.println(F("                  POT raw 0..4095 (2048=center)"));
+  Serial.println(F(""));
+  Serial.println(F("--- Non-ML AI layer (Utility-Based Agent) ---"));
+  Serial.println(F("utility            - show last AI utility breakdown"));
+  Serial.println(F("utilon             - let the AI layer drive the LED"));
+  Serial.println(F("utiloff            - AI layer advisory only (default)"));
+  Serial.println(F("setutil C E M [F]  - weights comfort energy smooth [+floor%]"));
   Serial.println();
 }
 
@@ -1140,6 +1169,68 @@ void handleSerialCommand() {
     if (pot < 0 || pot > 4095)     { Serial.print(F("[x] Pot 0..4095, got "));       Serial.println(pot); return; }
 
     testManualPrediction(hh, mm, dd, amb, mot, pot);
+  }
+  else if (command == "utility") {
+    // Non-ML AI layer: show the last utility-based evaluation + breakdown.
+    utilityAgentPrint(g_util_result);
+  }
+  else if (command == "utilon") {
+    util_apply = true;
+    Serial.println();
+    Serial.println(F("[v] Utility agent ENABLED - it now drives the LED."));
+    Serial.println(F("    (RF-KNN output is used as the comfort anchor.)"));
+    Serial.println();
+  }
+  else if (command == "utiloff") {
+    util_apply = false;
+    Serial.println();
+    Serial.println(F("[v] Utility agent ADVISORY only - RF-KNN drives the LED."));
+    Serial.println(F("    (Default. Use 'utility' to view its recommendation.)"));
+    Serial.println();
+  }
+  else if (command.startsWith("setutil ")) {
+    // setutil COMFORT ENERGY SMOOTH [MINSAFE]
+    //   COMFORT/ENERGY/SMOOTH : soft utility weights (>= 0)
+    //   MINSAFE (optional)    : hard night-motion safety floor 0..100 (%)
+    String args = command.substring(8);
+    args.trim();
+
+    String tok[8];
+    int n = tokenizeArgs(args, tok, 8);
+
+    if (n != 3 && n != 4) {
+      Serial.println(F("[x] Usage: setutil COMFORT ENERGY SMOOTH [MINSAFE]"));
+      Serial.println(F("    weights >= 0 ; optional MINSAFE 0..100 (night-motion floor)"));
+      return;
+    }
+
+    float wc = tok[0].toFloat();
+    float we = tok[1].toFloat();
+    float wm = tok[2].toFloat();
+
+    if (wc < 0 || we < 0 || wm < 0) {
+      Serial.println(F("[x] Weights must be >= 0"));
+      return;
+    }
+
+    int ms = g_util_cfg.min_safe_night;
+    if (n == 4) {
+      ms = tok[3].toInt();
+      if (ms < 0 || ms > 100) {
+        Serial.println(F("[x] MINSAFE must be 0..100"));
+        return;
+      }
+    }
+
+    g_util_cfg.w_comfort     = wc;
+    g_util_cfg.w_energy      = we;
+    g_util_cfg.w_smooth      = wm;
+    g_util_cfg.min_safe_night = ms;
+
+    Serial.print(F("[v] Utility weights set: comfort=")); Serial.print(wc, 2);
+    Serial.print(F(" energy=")); Serial.print(we, 2);
+    Serial.print(F(" smooth=")); Serial.print(wm, 2);
+    Serial.print(F(" | night-motion floor=")); Serial.print(ms); Serial.println(F("%"));
   }
   else if (command.length() > 0) {
     Serial.print(F("[x] Unknown: ")); Serial.println(command);
