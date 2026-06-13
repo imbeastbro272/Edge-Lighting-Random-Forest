@@ -3,181 +3,839 @@
  * 
  * Features:
  * - Live sensor input (ambient light, motion)
- * - ML-based brightness prediction
+ * - Random Forest ML-based brightness prediction
  * - User feedback collection for online learning
- * - WiFi connectivity for model updates
- * - SPIFFS storage for learning data
- * - Web interface for monitoring and control
+ * - EEPROM storage for learning data
+ * - Serial interface for monitoring and control
+ * - Manual control via potentiometer
  * 
  * Hardware Requirements:
  * - ESP32 board
- * - LDR (Light Dependent Resistor) or BH1750 light sensor
+ * - LDR (Light Dependent Resistor)
  * - PIR motion sensor
  * - LED strip (PWM controlled)
- * - RTC module (DS3231 or use NTP)
+ * - RTC module (DS3231)
+ * - Potentiometer for manual adjustment
  * 
  * Pin Configuration:
  * - GPIO34: LDR/Light sensor (ADC)
- * - GPIO35: PIR motion sensor
- * - GPIO16: LED PWM output
+ * - GPIO27: PIR motion sensor
+ * - GPIO33: Potentiometer (manual control)
+ * - GPIO2: LED PWM output
  */
 
-#include <WiFi.h>
-#include <WebServer.h>
-#include <SPIFFS.h>
 #include <Wire.h>
 #include <RTClib.h>
-#include <ArduinoJson.h>
-#include "led_rf_model.h"  // Generated model header
+#include <EEPROM.h>
+#include <math.h>
+#include "led_rf_model.h"  // Generated Random Forest model header
+
+// ============================================================================
+// PIN DEFINITIONS
+// ============================================================================
+
+#define PIR_PIN 27
+#define LDR_PIN 34
+#define POT_PIN 33
+#define LED_PIN 2
 
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 
-// WiFi credentials
-const char* WIFI_SSID = "YourWiFiSSID";
-const char* WIFI_PASSWORD = "YourWiFiPassword";
+#define UPDATE_INTERVAL 1000
+#define SMOOTHING_FACTOR 0.7
+#define POT_DEADZONE 200
 
-// Pin definitions
-#define PIN_LIGHT_SENSOR 34   // ADC pin for LDR
-#define PIN_MOTION_SENSOR 35  // Digital input for PIR
-#define PIN_LED_PWM 16        // PWM output for LED
+#define LEARNING_ENABLED true
 
-// PWM configuration
-#define PWM_CHANNEL 0
-#define PWM_FREQUENCY 5000
-#define PWM_RESOLUTION 8  // 0-255
+#define POT_STABLE_DURATION 5000
+#define POT_CHANGE_THRESHOLD 50
+#define MAX_CHANGES_BEFORE_RETRAIN 20
 
-// Sensor calibration
-#define LDR_MIN_VALUE 0
-#define LDR_MAX_VALUE 4095
-#define LIGHT_MIN_LUX 0
-#define LIGHT_MAX_LUX 1000
+#define RETRAIN_HOUR 0
+#define RETRAIN_MINUTE 0
+#define RETRAIN_SECOND 1
 
-// Online learning configuration
-#define LEARNING_BUFFER_SIZE 100
-#define FEEDBACK_TIMEOUT_MS 30000  // 30 seconds to provide feedback
+#define EEPROM_SIZE 4096
 
 // ============================================================================
-// GLOBAL VARIABLES
+// TRAINING SAMPLE STORAGE
+// ============================================================================
+
+#define MAX_TRAINING_SAMPLES 100
+#define SAMPLE_SIZE 32  // bytes per sample
+#define EEPROM_SAMPLES_START 100
+#define EEPROM_SAMPLE_COUNT_ADDR 0
+#define EEPROM_MODEL_WEIGHTS_START 3300  // Store model weights here
+
+struct TrainingSample {
+  float ambient_light;
+  float sin_hour;
+  float cos_hour;
+  int motion_detected;
+  int time_period;
+  int day_of_week;
+  float target_brightness;  // User's desired brightness
+  uint32_t timestamp;
+};
+
+int training_sample_count = 0;
+
+// ============================================================================
+// ADAPTIVE MODEL PARAMETERS
+// ============================================================================
+
+// Simplified adaptive model: weighted features + bias
+struct ModelWeights {
+  float ambient_weight;
+  float motion_weight;
+  float sin_hour_weight;
+  float cos_hour_weight;
+  float time_period_weights[5];  // 5 time periods
+  float day_of_week_weights[7];  // 7 days
+  float bias;
+  float learning_rate;
+  uint32_t update_count;
+};
+
+ModelWeights adaptive_model;
+bool use_adaptive_model = false;  // Start with RF, switch after retraining
+
+// ============================================================================
+// RTC
 // ============================================================================
 
 RTC_DS3231 rtc;
-WebServer server(80);
 
-// Current state
-struct SystemState {
-  float ambient_light;
-  int motion_detected;
-  int hour;
-  int day_of_week;
-  int predicted_brightness;
-  int actual_brightness;
-  unsigned long prediction_time;
-  bool feedback_pending;
-};
+// ============================================================================
+// STATE VARIABLES
+// ============================================================================
 
-SystemState state;
+float smoothed_ldr = 0;
+float smoothed_brightness = 0;
+int manual_offset = 0;
+unsigned long last_update = 0;
 
-// Online learning buffer
-struct LearningData {
-  float ambient_light;
-  int motion_detected;
-  float sin_hour;
-  float cos_hour;
-  int time_period;
-  int day_of_week;
-  int brightness;
-  unsigned long timestamp;
-};
+// ============================================================================
+// MODE CONTROL
+// ============================================================================
 
-LearningData learningBuffer[LEARNING_BUFFER_SIZE];
-int bufferIndex = 0;
-int bufferCount = 0;
+bool manual_mode = false;  // false = AUTO mode, true = MANUAL mode
 
-// Statistics
-struct Statistics {
-  unsigned long predictions_made;
-  unsigned long feedbacks_received;
-  float avg_prediction_error;
-  unsigned long last_update_time;
-};
+// ============================================================================
+// RETRAINING STATE
+// ============================================================================
 
-Statistics stats = {0, 0, 0.0, 0};
+int last_stable_pot_value = -1;
+int current_pot_candidate = -1;
+unsigned long pot_stable_start = 0;
+bool pot_candidate_active = false;
+
+int pot_change_count_today = 0;
+bool retrained_at_midnight = false;
+bool retrained_at_20_changes = false;
+int last_retrain_day = -1;
+
+// ============================================================================
+// STATS
+// ============================================================================
+
+unsigned long prediction_count = 0;
+float avg_brightness = 0;
+
+// ============================================================================
+// TRAINING SAMPLE MANAGEMENT
+// ============================================================================
+
+void initializeTrainingStorage() {
+  // Read sample count from EEPROM
+  EEPROM.get(EEPROM_SAMPLE_COUNT_ADDR, training_sample_count);
+  
+  if (training_sample_count < 0 || training_sample_count > MAX_TRAINING_SAMPLES) {
+    training_sample_count = 0;
+    EEPROM.put(EEPROM_SAMPLE_COUNT_ADDR, training_sample_count);
+    EEPROM.commit();
+  }
+  
+  Serial.print(F("Training samples in memory: "));
+  Serial.println(training_sample_count);
+}
+
+void saveTrainingSample(TrainingSample sample) {
+  if (training_sample_count >= MAX_TRAINING_SAMPLES) {
+    // Overwrite oldest sample (circular buffer)
+    training_sample_count = 0;
+  }
+  
+  int addr = EEPROM_SAMPLES_START + (training_sample_count * SAMPLE_SIZE);
+  EEPROM.put(addr, sample);
+  
+  training_sample_count++;
+  EEPROM.put(EEPROM_SAMPLE_COUNT_ADDR, training_sample_count);
+  EEPROM.commit();
+  
+  Serial.print(F("Training sample saved. Total: "));
+  Serial.println(training_sample_count);
+}
+
+TrainingSample loadTrainingSample(int index) {
+  TrainingSample sample;
+  int addr = EEPROM_SAMPLES_START + (index * SAMPLE_SIZE);
+  EEPROM.get(addr, sample);
+  return sample;
+}
+
+void captureTrainingSample(float ml_pred, float user_brightness) {
+  DateTime now = rtc.now();
+  
+  TrainingSample sample;
+  sample.ambient_light = smoothed_ldr;
+  sample.sin_hour = sin(2.0 * PI * now.hour() / 24.0);
+  sample.cos_hour = cos(2.0 * PI * now.hour() / 24.0);
+  sample.motion_detected = digitalRead(PIR_PIN);
+  sample.time_period = getTimePeriod(now.hour());
+  sample.day_of_week = (now.dayOfTheWeek() + 6) % 7;
+  sample.target_brightness = user_brightness;
+  sample.timestamp = now.unixtime();
+  
+  saveTrainingSample(sample);
+  
+  Serial.print(F("Captured: Ambient="));
+  Serial.print(sample.ambient_light);
+  Serial.print(F(" ML="));
+  Serial.print(ml_pred);
+  Serial.print(F("% User="));
+  Serial.print(user_brightness);
+  Serial.println(F("%"));
+}
+
+// ============================================================================
+// ADAPTIVE MODEL INITIALIZATION
+// ============================================================================
+
+void initializeAdaptiveModel() {
+  // Initialize with reasonable defaults
+  adaptive_model.ambient_weight = -0.02;  // More light = less brightness
+  adaptive_model.motion_weight = 15.0;    // Motion adds brightness
+  adaptive_model.sin_hour_weight = 5.0;
+  adaptive_model.cos_hour_weight = 5.0;
+  
+  // Time period weights (early morning, morning, afternoon, evening, night)
+  adaptive_model.time_period_weights[0] = 30.0;  // Early morning
+  adaptive_model.time_period_weights[1] = 20.0;  // Morning
+  adaptive_model.time_period_weights[2] = 15.0;  // Afternoon
+  adaptive_model.time_period_weights[3] = 25.0;  // Evening
+  adaptive_model.time_period_weights[4] = 40.0;  // Night
+  
+  // Day of week weights (Mon-Sun)
+  for (int i = 0; i < 7; i++) {
+    adaptive_model.day_of_week_weights[i] = 0.0;  // Neutral
+  }
+  
+  adaptive_model.bias = 50.0;
+  adaptive_model.learning_rate = 0.01;
+  adaptive_model.update_count = 0;
+}
+
+void saveAdaptiveModel() {
+  EEPROM.put(EEPROM_MODEL_WEIGHTS_START, adaptive_model);
+  EEPROM.commit();
+  Serial.println(F("Model weights saved to EEPROM"));
+}
+
+void loadAdaptiveModel() {
+  EEPROM.get(EEPROM_MODEL_WEIGHTS_START, adaptive_model);
+  
+  // Validate loaded data
+  if (isnan(adaptive_model.bias) || adaptive_model.update_count > 1000000) {
+    Serial.println(F("Invalid model data, reinitializing"));
+    initializeAdaptiveModel();
+  } else {
+    Serial.print(F("Loaded model with "));
+    Serial.print(adaptive_model.update_count);
+    Serial.println(F(" updates"));
+  }
+}
+
+// ============================================================================
+// PREDICTION WITH ADAPTIVE MODEL
+// ============================================================================
+
+float predictAdaptive(float ambient, int motion, float sin_h, float cos_h, 
+                      int period, int day) {
+  float prediction = adaptive_model.bias;
+  
+  prediction += adaptive_model.ambient_weight * ambient;
+  prediction += adaptive_model.motion_weight * motion;
+  prediction += adaptive_model.sin_hour_weight * sin_h;
+  prediction += adaptive_model.cos_hour_weight * cos_h;
+  prediction += adaptive_model.time_period_weights[period];
+  prediction += adaptive_model.day_of_week_weights[day];
+  
+  return constrain(prediction, 0, 100);
+}
+
+// ============================================================================
+// LIVE RETRAINING IMPLEMENTATION
+// ============================================================================
+
+void performRetraining() {
+  Serial.println(F(""));
+  Serial.println(F("========================================"));
+  Serial.println(F("      LIVE RETRAINING IN PROGRESS"));
+  Serial.println(F("========================================"));
+  
+  if (training_sample_count < 5) {
+    Serial.println(F("Insufficient samples (need >=5). Skipping."));
+    return;
+  }
+  
+  Serial.print(F("Training on "));
+  Serial.print(training_sample_count);
+  Serial.println(F(" samples..."));
+  
+  // GRADIENT DESCENT RETRAINING
+  int num_epochs = 10;
+  float total_error = 0;
+  
+  for (int epoch = 0; epoch < num_epochs; epoch++) {
+    float epoch_error = 0;
+    
+    for (int i = 0; i < training_sample_count; i++) {
+      TrainingSample sample = loadTrainingSample(i);
+      
+      // Forward pass
+      float prediction = predictAdaptive(
+        sample.ambient_light,
+        sample.motion_detected,
+        sample.sin_hour,
+        sample.cos_hour,
+        sample.time_period,
+        sample.day_of_week
+      );
+      
+      // Calculate error
+      float error = sample.target_brightness - prediction;
+      epoch_error += abs(error);
+      
+      // Backward pass - gradient descent
+      float lr = adaptive_model.learning_rate;
+      
+      adaptive_model.ambient_weight += lr * error * sample.ambient_light;
+      adaptive_model.motion_weight += lr * error * sample.motion_detected;
+      adaptive_model.sin_hour_weight += lr * error * sample.sin_hour;
+      adaptive_model.cos_hour_weight += lr * error * sample.cos_hour;
+      adaptive_model.time_period_weights[sample.time_period] += lr * error;
+      adaptive_model.day_of_week_weights[sample.day_of_week] += lr * error;
+      adaptive_model.bias += lr * error;
+    }
+    
+    if (epoch == num_epochs - 1) {
+      total_error = epoch_error / training_sample_count;
+    }
+  }
+  
+  adaptive_model.update_count++;
+  
+  // Save updated model
+  saveAdaptiveModel();
+  
+  // Enable adaptive model
+  use_adaptive_model = true;
+  
+  Serial.println(F(""));
+  Serial.println(F("RETRAINING COMPLETE"));
+  Serial.print(F("  Average Error: "));
+  Serial.print(total_error);
+  Serial.println(F("%"));
+  Serial.print(F("  Total Updates: "));
+  Serial.println(adaptive_model.update_count);
+  Serial.println(F("  Model: ADAPTIVE (User-Learned)"));
+  Serial.println(F("========================================"));
+  Serial.println(F(""));
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+float readLDR() {
+  long sum = 0;
+  
+  for (int i = 0; i < 20; i++) {
+    sum += analogRead(LDR_PIN);
+    delay(2);
+  }
+  
+  float avg = sum / 20.0;
+  float voltage = (avg / 4095.0) * 3.3;
+  
+  if (voltage <= 0.01) {
+    return 0;
+  }
+  
+  float r_ldr = 10000.0 * voltage / (3.3 - voltage);
+  float lux = 32768000.0 * pow(r_ldr, -1.4);
+  lux = constrain(lux, 0, 100000);
+  
+  return lux;
+}
+
+int readManualOffset() {
+  int pot_value = analogRead(POT_PIN);
+  int center = 2048;
+  
+  if (pot_value >= center - POT_DEADZONE &&
+      pot_value <= center + POT_DEADZONE) {
+    return 0;
+  }
+  
+  int offset;
+  
+  if (pot_value < center - POT_DEADZONE) {
+    offset = map(pot_value, 0, center - POT_DEADZONE, -100, 0);
+  } else {
+    offset = map(pot_value, center + POT_DEADZONE, 4095, 0, 100);
+  }
+  
+  return offset;
+}
+
+int getTimePeriod(int hour) {
+  if (hour >= 4 && hour <= 6) {
+    return 0;  // Early morning
+  } else if (hour > 6 && hour <= 12) {
+    return 1;  // Morning
+  } else if (hour > 12 && hour <= 16) {
+    return 2;  // Afternoon
+  } else if (hour > 16 && hour <= 20) {
+    return 3;  // Evening
+  } else {
+    return 4;  // Night
+  }
+}
+
+void printDateTime(DateTime dt) {
+  char buf[20];
+  sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d",
+          dt.year(), dt.month(), dt.day(),
+          dt.hour(), dt.minute(), dt.second());
+  Serial.print(buf);
+}
+
+// ============================================================================
+// RETRAINING MONITORING
+// ============================================================================
+
+void monitorPotForRetraining(unsigned long current_time, 
+                             float ml_pred, float user_brightness) {
+  int current_pot_raw = analogRead(POT_PIN);
+  
+  if (pot_candidate_active) {
+    if (abs(current_pot_raw - current_pot_candidate) <= POT_CHANGE_THRESHOLD) {
+      if (current_time - pot_stable_start >= POT_STABLE_DURATION) {
+        if (last_stable_pot_value == -1 ||
+            abs(current_pot_raw - last_stable_pot_value) > POT_CHANGE_THRESHOLD) {
+          
+          last_stable_pot_value = current_pot_raw;
+          pot_candidate_active = false;
+          pot_change_count_today++;
+          
+          // CAPTURE TRAINING SAMPLE
+          if (abs(manual_offset) > 5) {  // Only capture if user made significant adjustment
+            captureTrainingSample(ml_pred, user_brightness);
+          }
+          
+          Serial.print(F("Pot Change #"));
+          Serial.println(pot_change_count_today);
+          
+          if (pot_change_count_today >= MAX_CHANGES_BEFORE_RETRAIN &&
+              !retrained_at_20_changes) {
+            performRetraining();
+            retrained_at_20_changes = true;
+          }
+        }
+      }
+    } else {
+      current_pot_candidate = current_pot_raw;
+      pot_stable_start = current_time;
+    }
+  } else {
+    if (last_stable_pot_value == -1) {
+      last_stable_pot_value = current_pot_raw;
+    } else if (abs(current_pot_raw - last_stable_pot_value) > POT_CHANGE_THRESHOLD) {
+      pot_candidate_active = true;
+      current_pot_candidate = current_pot_raw;
+      pot_stable_start = current_time;
+    }
+  }
+}
+
+void checkScheduledRetraining(DateTime &now) {
+  int current_day = now.day();
+  
+  if (current_day != last_retrain_day && last_retrain_day != -1) {
+    pot_change_count_today = 0;
+    retrained_at_midnight = false;
+    retrained_at_20_changes = false;
+    last_retrain_day = current_day;
+  }
+  
+  if (last_retrain_day == -1) {
+    last_retrain_day = current_day;
+  }
+  
+  if (now.hour() == RETRAIN_HOUR &&
+      now.minute() == RETRAIN_MINUTE &&
+      now.second() == RETRAIN_SECOND &&
+      !retrained_at_midnight) {
+    performRetraining();
+    retrained_at_midnight = true;
+  }
+}
+
+// ============================================================================
+// SERIAL COMMAND HANDLING
+// ============================================================================
+
+void testManualPrediction(int hour, int day, float ambient, int motion, int pot_value) {
+  float sin_hour = sin(2.0 * PI * hour / 24.0);
+  float cos_hour = cos(2.0 * PI * hour / 24.0);
+  int time_period = getTimePeriod(hour);
+  
+  // Calculate offset from pot value
+  int center = 2048;
+  int offset = 0;
+  
+  if (pot_value >= center - POT_DEADZONE && pot_value <= center + POT_DEADZONE) {
+    offset = 0;
+  }
+  else if (pot_value < center - POT_DEADZONE) {
+    offset = map(pot_value, 0, center - POT_DEADZONE, -100, 0);
+  }
+  else {
+    offset = map(pot_value, center + POT_DEADZONE, 4095, 0, 100);
+  }
+  
+  // Get predictions from both models
+  float rf_pred = predict_led_brightness(ambient, motion, hour, day);
+  float adaptive_pred = predictAdaptive(ambient, motion, sin_hour, cos_hour, time_period, day);
+  
+  // Calculate final brightness
+  float rf_final = constrain(rf_pred + offset, 0, 100);
+  float adaptive_final = constrain(adaptive_pred + offset, 0, 100);
+  
+  // Display results
+  Serial.println(F(""));
+  Serial.println(F("========================================"));
+  Serial.println(F("   MANUAL PREDICTION TEST RESULTS"));
+  Serial.println(F("========================================"));
+  
+  const char* day_names[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+  const char* period_names[] = {"Early Morning", "Morning", "Afternoon", "Evening", "Night"};
+  
+  Serial.println(F("Input Parameters:"));
+  Serial.print(F("  Time: "));
+  Serial.print(hour);
+  Serial.print(F(":00 ("));
+  Serial.print(period_names[time_period]);
+  Serial.println(F(")"));
+  Serial.print(F("  Day: "));
+  Serial.println(day_names[day]);
+  Serial.print(F("  Ambient Light: "));
+  Serial.print(ambient);
+  Serial.println(F(" lux"));
+  Serial.print(F("  Motion: "));
+  Serial.println(motion ? F("YES") : F("NO"));
+  Serial.print(F("  Pot Value: "));
+  Serial.print(pot_value);
+  Serial.print(F(" (Offset: "));
+  Serial.print(offset);
+  Serial.println(F("%)"));
+  
+  Serial.println(F(""));
+  Serial.println(F("Model Predictions:"));
+  Serial.println(F("+------------------+----------+----------+----------+"));
+  Serial.println(F("| Model            | Raw (%)  | Offset   | Final(%) |"));
+  Serial.println(F("+------------------+----------+----------+----------+"));
+  
+  char rf_line[60];
+  sprintf(rf_line, "| Random Forest    | %7.2f | %+7d | %7.2f |", rf_pred, offset, rf_final);
+  Serial.println(rf_line);
+  
+  char adaptive_line[60];
+  sprintf(adaptive_line, "| Adaptive(Learn)  | %7.2f | %+7d | %7.2f |", adaptive_pred, offset, adaptive_final);
+  Serial.println(adaptive_line);
+  
+  Serial.println(F("+------------------+----------+----------+----------+"));
+  
+  float diff = adaptive_pred - rf_pred;
+  Serial.println(F(""));
+  Serial.println(F("Model Comparison:"));
+  Serial.print(F("  Difference: "));
+  Serial.print(diff);
+  Serial.println(F("%"));
+  Serial.print(F("  Active Model: "));
+  Serial.println(use_adaptive_model ? F("ADAPTIVE (Learned)") : F("RANDOM FOREST (Original)"));
+  
+  Serial.println(F("========================================"));
+  Serial.println(F(""));
+}
+
+void handleSerialCommand() {
+  String command = Serial.readStringUntil('\n');
+  command.trim();
+  
+  if (command == "help") {
+    Serial.println(F("=== BASIC COMMANDS ==="));
+    Serial.println(F("help          - Show all commands"));
+    Serial.println(F("stats         - Show statistics"));
+    Serial.println(F("retrain       - Force retraining"));
+    Serial.println(F(""));
+    Serial.println(F("=== MODE CONTROL ==="));
+    Serial.println(F("auto          - Switch to AUTO mode (with retraining)"));
+    Serial.println(F("manual        - Switch to MANUAL mode (validation only)"));
+    Serial.println(F("mode          - Show current mode"));
+    Serial.println(F(""));
+    Serial.println(F("=== SAMPLE MANAGEMENT ==="));
+    Serial.println(F("samples       - View training samples"));
+    Serial.println(F("clearsamples  - Clear all samples"));
+    Serial.println(F(""));
+    Serial.println(F("=== MODEL INSPECTION ==="));
+    Serial.println(F("modelinfo     - Show model summary"));
+    Serial.println(F("resetmodel    - Reset model to defaults"));
+    Serial.println(F(""));
+    Serial.println(F("=== MANUAL TESTING ==="));
+    Serial.println(F("test HH DD AMBIENT MOTION POT"));
+    Serial.println(F("  HH: Hour (0-23)"));
+    Serial.println(F("  DD: Day (0=Mon, 1=Tue, ..., 6=Sun)"));
+    Serial.println(F("  AMBIENT: Light level in lux (0-10000)"));
+    Serial.println(F("  MOTION: 0=No, 1=Yes"));
+    Serial.println(F("  POT: Pot value (0-4095, 2048=center)"));
+    Serial.println(F(""));
+    Serial.println(F("Example: test 22 1 300 1 2200"));
+    Serial.println(F("         (10 PM, Tuesday, 300 lux, motion, pot=2200)"));
+  }
+  else if (command == "auto") {
+    manual_mode = false;
+    Serial.println(F(""));
+    Serial.println(F("========================================"));
+    Serial.println(F("    SWITCHED TO AUTO MODE"));
+    Serial.println(F("========================================"));
+    Serial.println(F("  - Live sensor readings"));
+    Serial.println(F("  - ML predictions active"));
+    Serial.println(F("  - Potentiometer adjustments captured"));
+    Serial.println(F("  - Automatic retraining enabled"));
+    Serial.println(F("========================================"));
+    Serial.println(F(""));
+  }
+  else if (command == "manual") {
+    manual_mode = true;
+    Serial.println(F(""));
+    Serial.println(F("========================================"));
+    Serial.println(F("    SWITCHED TO MANUAL MODE"));
+    Serial.println(F("========================================"));
+    Serial.println(F("  - Use 'test' command for validation"));
+    Serial.println(F("  - No automatic updates"));
+    Serial.println(F("  - No retraining"));
+    Serial.println(F("  - LED controlled manually via pot"));
+    Serial.println(F(""));
+    Serial.println(F("Try: test 22 1 300 1 2048"));
+    Serial.println(F("========================================"));
+    Serial.println(F(""));
+  }
+  else if (command == "mode") {
+    Serial.println(F(""));
+    Serial.println(F("=== CURRENT MODE ==="));
+    Serial.print(F("Mode: "));
+    Serial.println(manual_mode ? F("MANUAL (Validation/Testing)") : F("AUTO (Live with Retraining)"));
+    Serial.print(F("Model: "));
+    Serial.println(use_adaptive_model ? F("ADAPTIVE (Learned)") : F("RANDOM FOREST (Original)"));
+    Serial.print(F("Training Samples: "));
+    Serial.println(training_sample_count);
+    Serial.print(F("Predictions Made: "));
+    Serial.println(prediction_count);
+    Serial.println(F(""));
+  }
+  else if (command == "stats") {
+    Serial.println(F("=== STATISTICS ==="));
+    Serial.print(F("Mode: "));
+    Serial.println(manual_mode ? F("MANUAL") : F("AUTO"));
+    Serial.print(F("Predictions: "));
+    Serial.println(prediction_count);
+    Serial.print(F("Average Brightness: "));
+    Serial.println(avg_brightness);
+    Serial.print(F("Pot Changes Today: "));
+    Serial.println(pot_change_count_today);
+    Serial.print(F("Training Samples: "));
+    Serial.println(training_sample_count);
+    Serial.print(F("Model Type: "));
+    Serial.println(use_adaptive_model ? F("ADAPTIVE") : F("RANDOM FOREST"));
+  }
+  else if (command == "retrain") {
+    performRetraining();
+  }
+  else if (command == "samples") {
+    Serial.println(F("=== TRAINING SAMPLES ==="));
+    if (training_sample_count == 0) {
+      Serial.println(F("No samples collected yet"));
+      return;
+    }
+    Serial.print(F("Total Samples: "));
+    Serial.println(training_sample_count);
+    
+    for (int i = 0; i < training_sample_count; i++) {
+      TrainingSample s = loadTrainingSample(i);
+      Serial.print(i + 1);
+      Serial.print(F(". Ambient="));
+      Serial.print(s.ambient_light);
+      Serial.print(F(" Motion="));
+      Serial.print(s.motion_detected);
+      Serial.print(F(" Target="));
+      Serial.print(s.target_brightness);
+      Serial.print(F("% Time="));
+      Serial.println(s.timestamp);
+    }
+  }
+  else if (command == "clearsamples") {
+    training_sample_count = 0;
+    EEPROM.put(EEPROM_SAMPLE_COUNT_ADDR, training_sample_count);
+    EEPROM.commit();
+    Serial.println(F("All samples cleared"));
+  }
+  else if (command == "resetmodel") {
+    initializeAdaptiveModel();
+    saveAdaptiveModel();
+    use_adaptive_model = false;
+    Serial.println(F("Model reset to defaults"));
+    Serial.println(F("Switched back to RANDOM FOREST model"));
+  }
+  else if (command == "modelinfo") {
+    Serial.println(F("=== MODEL INFO ==="));
+    Serial.print(F("Type: "));
+    Serial.println(use_adaptive_model ? F("ADAPTIVE (Learned)") : F("RANDOM FOREST (Original)"));
+    Serial.print(F("Update Count: "));
+    Serial.println(adaptive_model.update_count);
+    Serial.print(F("Learning Rate: "));
+    Serial.println(adaptive_model.learning_rate, 6);
+    Serial.print(F("Bias: "));
+    Serial.println(adaptive_model.bias, 2);
+  }
+  else if (command.startsWith("test ")) {
+    int hour, day, motion, pot;
+    float ambient;
+    
+    int parsed = sscanf(command.c_str(), "test %d %d %f %d %d", &hour, &day, &ambient, &motion, &pot);
+    
+    if (parsed == 5) {
+      // Validate inputs
+      if (hour < 0 || hour > 23) {
+        Serial.println(F("Error: Hour must be 0-23"));
+        return;
+      }
+      if (day < 0 || day > 6) {
+        Serial.println(F("Error: Day must be 0-6 (0=Mon, 6=Sun)"));
+        return;
+      }
+      if (ambient < 0 || ambient > 100000) {
+        Serial.println(F("Error: Ambient must be 0-100000 lux"));
+        return;
+      }
+      if (motion != 0 && motion != 1) {
+        Serial.println(F("Error: Motion must be 0 or 1"));
+        return;
+      }
+      if (pot < 0 || pot > 4095) {
+        Serial.println(F("Error: Pot must be 0-4095"));
+        return;
+      }
+      
+      testManualPrediction(hour, day, ambient, motion, pot);
+    } else {
+      Serial.println(F("Invalid format. Use: test HH DD AMBIENT MOTION POT"));
+      Serial.println(F("Example: test 22 1 300 1 2200"));
+    }
+  }
+}
 
 // ============================================================================
 // SETUP
 // ============================================================================
 
 void setup() {
-  Serial.begin(115200);
-  Serial.println("\n\n=================================");
-  Serial.println("ESP32 Adaptive Lighting System");
-  Serial.println("Random Forest ML Model");
-  Serial.println("=================================\n");
+  Serial.begin(9600);
   
-  // Initialize pins
-  pinMode(PIN_MOTION_SENSOR, INPUT);
-  pinMode(PIN_LIGHT_SENSOR, INPUT);
-  
-  // Setup PWM for LED
-  ledcSetup(PWM_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
-  ledcAttachPin(PIN_LED_PWM, PWM_CHANNEL);
-  
-  // Initialize SPIFFS
-  if (!SPIFFS.begin(true)) {
-    Serial.println("ERROR: SPIFFS mount failed!");
-  } else {
-    Serial.println("✓ SPIFFS initialized");
-    loadLearningBuffer();
+  while (!Serial) {
+    delay(10);
   }
   
-  // Initialize RTC
+  Serial.println(F("==================================="));
+  Serial.println(F("LED Controller - Random Forest ML"));
+  Serial.println(F("==================================="));
+  
+  pinMode(PIR_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(LDR_PIN, INPUT);
+  pinMode(POT_PIN, INPUT);
+  
+  // Setup PWM for LED (ESP32 v3.x API)
+  ledcAttach(LED_PIN, 5000, 8);
+  
+  EEPROM.begin(EEPROM_SIZE);
+  
+  Serial.print(F("Initializing RTC... "));
+  
   if (!rtc.begin()) {
-    Serial.println("WARNING: RTC not found, using compile time");
-    // Use compile time as fallback
-  } else {
-    Serial.println("✓ RTC initialized");
-    if (rtc.lostPower()) {
-      Serial.println("  RTC lost power, setting time...");
-      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    Serial.println(F("FAILED"));
+    while (1) {
+      delay(1000);
     }
   }
   
-  // Connect to WiFi
-  Serial.print("Connecting to WiFi");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  int wifi_attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && wifi_attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    wifi_attempts++;
+  Serial.println(F("OK"));
+  
+  if (rtc.lostPower()) {
+    Serial.println(F("RTC lost power. Setting compile time."));
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
   }
   
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n✓ WiFi connected");
-    Serial.print("  IP address: ");
-    Serial.println(WiFi.localIP());
-    
-    // Setup web server
-    setupWebServer();
-    server.begin();
-    Serial.println("✓ Web server started");
+  Serial.print(F("Current Time: "));
+  printDateTime(rtc.now());
+  Serial.println();
+  
+  // Initialize training storage
+  initializeTrainingStorage();
+  
+  // Initialize or load adaptive model
+  if (training_sample_count > 0) {
+    loadAdaptiveModel();
+    use_adaptive_model = true;
   } else {
-    Serial.println("\n⚠ WiFi connection failed, running offline");
+    initializeAdaptiveModel();
   }
   
-  // Initialize state
-  state.feedback_pending = false;
-  state.prediction_time = 0;
+  smoothed_ldr = readLDR();
   
-  Serial.println("\n=================================");
-  Serial.println("System Ready!");
-  Serial.println("=================================\n");
+  Serial.println(F("=== FEATURES ==="));
+  Serial.println(F("Random Forest ML prediction"));
+  Serial.println(F("Real-time sample collection"));
+  Serial.println(F("Gradient descent retraining"));
+  Serial.println(F("Persistent model storage"));
+  Serial.println(F("AUTO/MANUAL mode switching"));
   
-  // Initial brightness reading
-  updateSensors();
-  makePrediction();
+  Serial.println(F(""));
+  Serial.println(F("=== MODES ==="));
+  Serial.println(F("AUTO   - Live predictions + retraining"));
+  Serial.println(F("MANUAL - Validation testing only"));
+  Serial.println(F(""));
+  Serial.println(F("Current Mode: AUTO (type 'manual' to switch)"));
+  
+  Serial.println(F(""));
+  Serial.println(F("=== Commands ==="));
+  Serial.println(F("help, auto, manual, mode, stats, test, retrain"));
+  
+  Serial.println(F("=== Monitoring Started ==="));
 }
 
 // ============================================================================
@@ -185,496 +843,108 @@ void setup() {
 // ============================================================================
 
 void loop() {
-  // Handle web server requests
-  server.handleClient();
+  unsigned long current_time = millis();
   
-  // Update sensors every second
-  static unsigned long lastSensorUpdate = 0;
-  if (millis() - lastSensorUpdate >= 1000) {
-    updateSensors();
-    lastSensorUpdate = millis();
+  // Handle Serial commands (always active in both modes)
+  if (Serial.available()) {
+    handleSerialCommand();
   }
   
-  // Make prediction every 10 seconds or when motion detected
-  static unsigned long lastPrediction = 0;
-  static int lastMotion = 0;
-  
-  if (state.motion_detected != lastMotion || 
-      millis() - lastPrediction >= 10000) {
-    makePrediction();
-    lastPrediction = millis();
-    lastMotion = state.motion_detected;
-  }
-  
-  // Check for feedback timeout
-  if (state.feedback_pending && 
-      millis() - state.prediction_time >= FEEDBACK_TIMEOUT_MS) {
-    // No feedback received, assume prediction was good
-    Serial.println("No feedback timeout - accepting prediction");
-    acceptPrediction();
-  }
-  
-  // Periodic status report
-  static unsigned long lastStatus = 0;
-  if (millis() - lastStatus >= 60000) {  // Every minute
-    printStatus();
-    lastStatus = millis();
-  }
-  
-  delay(10);
-}
-
-// ============================================================================
-// SENSOR FUNCTIONS
-// ============================================================================
-
-void updateSensors() {
-  // Read light sensor (LDR)
-  int ldr_value = analogRead(PIN_LIGHT_SENSOR);
-  state.ambient_light = map(ldr_value, LDR_MIN_VALUE, LDR_MAX_VALUE, 
-                            LIGHT_MIN_LUX, LIGHT_MAX_LUX);
-  
-  // Read motion sensor
-  state.motion_detected = digitalRead(PIN_MOTION_SENSOR);
-  
-  // Get current time
-  DateTime now = rtc.now();
-  state.hour = now.hour();
-  state.day_of_week = get_day_of_week_from_rtc(now.dayOfTheWeek());
-}
-
-// ============================================================================
-// PREDICTION FUNCTIONS
-// ============================================================================
-
-void makePrediction() {
-  // Get ML prediction
-  int predicted = predict_led_brightness(
-    state.ambient_light,
-    state.motion_detected,
-    state.hour,
-    state.day_of_week
-  );
-  
-  state.predicted_brightness = predicted;
-  state.prediction_time = millis();
-  state.feedback_pending = true;
-  
-  // Apply brightness
-  setBrightness(predicted);
-  state.actual_brightness = predicted;
-  
-  // Log prediction
-  stats.predictions_made++;
-  
-  Serial.println("\n--- New Prediction ---");
-  Serial.printf("Time: %02d:00, Day: %d\n", state.hour, state.day_of_week);
-  Serial.printf("Ambient: %.0f lux, Motion: %d\n", 
-                state.ambient_light, state.motion_detected);
-  Serial.printf("Predicted Brightness: %d%%\n", predicted);
-  Serial.println("--------------------");
-}
-
-void setBrightness(int brightness_percent) {
-  // Convert percentage to PWM value (0-255)
-  int pwm_value = map(brightness_percent, 0, 100, 0, 255);
-  ledcWrite(PWM_CHANNEL, pwm_value);
-  
-  Serial.printf("LED Brightness set to: %d%% (PWM: %d)\n", 
-                brightness_percent, pwm_value);
-}
-
-void acceptPrediction() {
-  if (!state.feedback_pending) return;
-  
-  // Add to learning buffer
-  addToLearningBuffer(
-    state.ambient_light,
-    state.motion_detected,
-    state.hour,
-    state.day_of_week,
-    state.actual_brightness
-  );
-  
-  state.feedback_pending = false;
-  stats.feedbacks_received++;
-  
-  Serial.println("✓ Prediction accepted and added to learning buffer");
-}
-
-void rejectPrediction(int user_brightness) {
-  if (!state.feedback_pending) return;
-  
-  // User provided different brightness
-  setBrightness(user_brightness);
-  state.actual_brightness = user_brightness;
-  
-  // Add corrected data to learning buffer
-  addToLearningBuffer(
-    state.ambient_light,
-    state.motion_detected,
-    state.hour,
-    state.day_of_week,
-    user_brightness
-  );
-  
-  // Update error statistics
-  int error = abs(state.predicted_brightness - user_brightness);
-  stats.avg_prediction_error = (stats.avg_prediction_error * stats.feedbacks_received + error) 
-                                / (stats.feedbacks_received + 1);
-  
-  state.feedback_pending = false;
-  stats.feedbacks_received++;
-  
-  Serial.printf("✓ User feedback: %d%% (error: %d%%)\n", 
-                user_brightness, error);
-}
-
-// ============================================================================
-// ONLINE LEARNING FUNCTIONS
-// ============================================================================
-
-void addToLearningBuffer(float ambient, int motion, int hour, 
-                        int day_of_week, int brightness) {
-  // Calculate time features
-  float sin_h, cos_h;
-  int time_period;
-  calculate_time_features(hour, &sin_h, &cos_h, &time_period);
-  
-  // Add to buffer
-  learningBuffer[bufferIndex] = {
-    ambient, motion, sin_h, cos_h, time_period, day_of_week, 
-    brightness, millis()
-  };
-  
-  bufferIndex = (bufferIndex + 1) % LEARNING_BUFFER_SIZE;
-  if (bufferCount < LEARNING_BUFFER_SIZE) bufferCount++;
-  
-  Serial.printf("Learning buffer: %d/%d samples\n", 
-                bufferCount, LEARNING_BUFFER_SIZE);
-  
-  // Auto-save periodically
-  static int save_counter = 0;
-  if (++save_counter >= 10) {
-    saveLearningBuffer();
-    save_counter = 0;
-  }
-}
-
-void saveLearningBuffer() {
-  File file = SPIFFS.open("/learning_data.csv", "w");
-  if (!file) {
-    Serial.println("ERROR: Failed to open learning data file for writing");
-    return;
-  }
-  
-  // Write header
-  file.println("ambient_light,motion_detected,sin_hour,cos_hour,time_period,day_of_week,led_brightness,timestamp");
-  
-  // Write data
-  for (int i = 0; i < bufferCount; i++) {
-    LearningData& data = learningBuffer[i];
-    file.printf("%.2f,%d,%.4f,%.4f,%d,%d,%d,%lu\n",
-                data.ambient_light, data.motion_detected,
-                data.sin_hour, data.cos_hour,
-                data.time_period, data.day_of_week,
-                data.brightness, data.timestamp);
-  }
-  
-  file.close();
-  Serial.printf("✓ Learning buffer saved (%d samples)\n", bufferCount);
-}
-
-void loadLearningBuffer() {
-  File file = SPIFFS.open("/learning_data.csv", "r");
-  if (!file) {
-    Serial.println("No existing learning data found");
-    return;
-  }
-  
-  // Skip header
-  file.readStringUntil('\n');
-  
-  bufferCount = 0;
-  bufferIndex = 0;
-  
-  while (file.available() && bufferCount < LEARNING_BUFFER_SIZE) {
-    String line = file.readStringUntil('\n');
-    if (line.length() > 0) {
-      // Parse CSV line
-      sscanf(line.c_str(), "%f,%d,%f,%f,%d,%d,%d,%lu",
-             &learningBuffer[bufferCount].ambient_light,
-             &learningBuffer[bufferCount].motion_detected,
-             &learningBuffer[bufferCount].sin_hour,
-             &learningBuffer[bufferCount].cos_hour,
-             &learningBuffer[bufferCount].time_period,
-             &learningBuffer[bufferCount].day_of_week,
-             &learningBuffer[bufferCount].brightness,
-             &learningBuffer[bufferCount].timestamp);
-      
-      bufferCount++;
-      bufferIndex = bufferCount % LEARNING_BUFFER_SIZE;
-    }
-  }
-  
-  file.close();
-  Serial.printf("✓ Loaded %d samples from learning buffer\n", bufferCount);
-}
-
-void exportLearningData() {
-  // Export learning data in format ready for retraining
-  File file = SPIFFS.open("/export_training_data.csv", "w");
-  if (!file) {
-    Serial.println("ERROR: Failed to export learning data");
-    return;
-  }
-  
-  file.println("ambient_light,motion_detected,sin_hour,cos_hour,time_period,day_of_week,led_brightness");
-  
-  for (int i = 0; i < bufferCount; i++) {
-    LearningData& data = learningBuffer[i];
-    file.printf("%.2f,%d,%.4f,%.4f,%d,%d,%d\n",
-                data.ambient_light, data.motion_detected,
-                data.sin_hour, data.cos_hour,
-                data.time_period, data.day_of_week,
-                data.brightness);
-  }
-  
-  file.close();
-  Serial.println("✓ Learning data exported for retraining");
-}
-
-// ============================================================================
-// WEB SERVER FUNCTIONS
-// ============================================================================
-
-void setupWebServer() {
-  // Main page
-  server.on("/", HTTP_GET, handleRoot);
-  
-  // API endpoints
-  server.on("/api/status", HTTP_GET, handleStatus);
-  server.on("/api/feedback", HTTP_POST, handleFeedback);
-  server.on("/api/manual", HTTP_POST, handleManual);
-  server.on("/api/export", HTTP_GET, handleExport);
-  server.on("/api/stats", HTTP_GET, handleStats);
-  
-  Serial.println("✓ Web server routes configured");
-}
-
-void handleRoot() {
-  String html = R"(
-<!DOCTYPE html>
-<html>
-<head>
-  <title>ESP32 Adaptive Lighting</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body { font-family: Arial; margin: 20px; background: #f0f0f0; }
-    .container { max-width: 600px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-    h1 { color: #333; text-align: center; }
-    .status { padding: 15px; margin: 10px 0; background: #e8f4f8; border-radius: 5px; }
-    .status-item { margin: 8px 0; }
-    .label { font-weight: bold; color: #555; }
-    .value { color: #007bff; }
-    button { padding: 12px 24px; margin: 5px; font-size: 16px; border: none; border-radius: 5px; cursor: pointer; }
-    .btn-accept { background: #28a745; color: white; }
-    .btn-reject { background: #dc3545; color: white; }
-    .btn-manual { background: #007bff; color: white; }
-    .slider { width: 100%; margin: 10px 0; }
-    #brightness-value { font-size: 24px; color: #007bff; font-weight: bold; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>🔆 Adaptive Lighting Control</h1>
+  // AUTO MODE: Live updates with retraining
+  if (!manual_mode && current_time - last_update >= UPDATE_INTERVAL) {
+    last_update = current_time;
     
-    <div class="status">
-      <h2>Current Status</h2>
-      <div class="status-item"><span class="label">Ambient Light:</span> <span class="value" id="ambient">--</span> lux</div>
-      <div class="status-item"><span class="label">Motion:</span> <span class="value" id="motion">--</span></div>
-      <div class="status-item"><span class="label">Time:</span> <span class="value" id="time">--</span></div>
-      <div class="status-item"><span class="label">Predicted:</span> <span class="value" id="predicted">--</span>%</div>
-      <div class="status-item"><span class="label">Current:</span> <span class="value" id="current">--</span>%</div>
-    </div>
+    DateTime now = rtc.now();
     
-    <div class="status">
-      <h2>Feedback</h2>
-      <p>Is the brightness correct?</p>
-      <button class="btn-accept" onclick="sendFeedback('accept')">✓ Accept</button>
-      <button class="btn-reject" onclick="sendFeedback('reject')">✗ Adjust</button>
-    </div>
+    int hour = now.hour();
+    int day_of_week = now.dayOfTheWeek();
+    int day_of_week_adjusted = (day_of_week + 6) % 7;
     
-    <div class="status">
-      <h2>Manual Control</h2>
-      <input type="range" min="0" max="100" value="50" class="slider" id="brightness-slider" oninput="updateSlider(this.value)">
-      <p><span id="brightness-value">50</span>%</p>
-      <button class="btn-manual" onclick="sendManual()">Set Brightness</button>
-    </div>
+    float ambient_light = readLDR();
+    int motion_detected = digitalRead(PIR_PIN);
     
-    <div class="status">
-      <h2>Statistics</h2>
-      <div class="status-item"><span class="label">Predictions:</span> <span class="value" id="predictions">--</span></div>
-      <div class="status-item"><span class="label">Feedbacks:</span> <span class="value" id="feedbacks">--</span></div>
-      <div class="status-item"><span class="label">Learning Buffer:</span> <span class="value" id="buffer">--</span></div>
-      <div class="status-item"><span class="label">Avg Error:</span> <span class="value" id="error">--</span>%</div>
-    </div>
+    smoothed_ldr =
+      SMOOTHING_FACTOR * smoothed_ldr +
+      (1 - SMOOTHING_FACTOR) * ambient_light;
     
-    <div style="text-align: center; margin-top: 20px;">
-      <button class="btn-manual" onclick="exportData()">📥 Export Learning Data</button>
-    </div>
-  </div>
-  
-  <script>
-    function updateStatus() {
-      fetch('/api/status')
-        .then(r => r.json())
-        .then(data => {
-          document.getElementById('ambient').textContent = data.ambient_light.toFixed(0);
-          document.getElementById('motion').textContent = data.motion_detected ? 'Detected' : 'None';
-          document.getElementById('time').textContent = data.hour + ':00, Day ' + data.day_of_week;
-          document.getElementById('predicted').textContent = data.predicted_brightness;
-          document.getElementById('current').textContent = data.actual_brightness;
-        });
-      
-      fetch('/api/stats')
-        .then(r => r.json())
-        .then(data => {
-          document.getElementById('predictions').textContent = data.predictions_made;
-          document.getElementById('feedbacks').textContent = data.feedbacks_received;
-          document.getElementById('buffer').textContent = data.buffer_count + '/' + data.buffer_size;
-          document.getElementById('error').textContent = data.avg_error.toFixed(1);
-        });
+    float sin_hour = sin(2.0 * PI * hour / 24.0);
+    float cos_hour = cos(2.0 * PI * hour / 24.0);
+    int time_period = getTimePeriod(hour);
+    
+    // CHOOSE MODEL: Adaptive or Random Forest
+    float ml_brightness;
+    if (use_adaptive_model) {
+      ml_brightness = predictAdaptive(
+        smoothed_ldr,
+        motion_detected,
+        sin_hour,
+        cos_hour,
+        time_period,
+        day_of_week_adjusted
+      );
+    } else {
+      // Use Random Forest prediction from led_rf_model.h
+      ml_brightness = predict_led_brightness(
+        smoothed_ldr,
+        motion_detected,
+        hour,
+        day_of_week_adjusted
+      );
     }
     
-    function sendFeedback(action) {
-      let brightness = action === 'reject' ? document.getElementById('brightness-slider').value : null;
-      fetch('/api/feedback', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({action: action, brightness: brightness})
-      }).then(() => alert('Feedback sent!'));
-    }
+    manual_offset = readManualOffset();
     
-    function sendManual() {
-      let brightness = document.getElementById('brightness-slider').value;
-      fetch('/api/manual', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({brightness: parseInt(brightness)})
-      }).then(() => alert('Brightness set to ' + brightness + '%'));
-    }
+    float final_brightness = ml_brightness + manual_offset;
+    final_brightness = constrain(final_brightness, 0, 100);
     
-    function updateSlider(val) {
-      document.getElementById('brightness-value').textContent = val;
-    }
+    smoothed_brightness =
+      SMOOTHING_FACTOR * smoothed_brightness +
+      (1 - SMOOTHING_FACTOR) * final_brightness;
     
-    function exportData() {
-      window.location.href = '/api/export';
-    }
+    int pwm_value = map(smoothed_brightness, 0, 100, 0, 255);
+    ledcWrite(LED_PIN, pwm_value);
     
-    setInterval(updateStatus, 2000);
-    updateStatus();
-  </script>
-</body>
-</html>
-  )";
-  
-  server.send(200, "text/html", html);
-}
-
-void handleStatus() {
-  StaticJsonDocument<256> doc;
-  doc["ambient_light"] = state.ambient_light;
-  doc["motion_detected"] = state.motion_detected;
-  doc["hour"] = state.hour;
-  doc["day_of_week"] = state.day_of_week;
-  doc["predicted_brightness"] = state.predicted_brightness;
-  doc["actual_brightness"] = state.actual_brightness;
-  doc["feedback_pending"] = state.feedback_pending;
-  
-  String json;
-  serializeJson(doc, json);
-  server.send(200, "application/json", json);
-}
-
-void handleFeedback() {
-  StaticJsonDocument<128> doc;
-  deserializeJson(doc, server.arg("plain"));
-  
-  String action = doc["action"];
-  
-  if (action == "accept") {
-    acceptPrediction();
-    server.send(200, "text/plain", "Feedback accepted");
-  } else if (action == "reject") {
-    int brightness = doc["brightness"];
-    rejectPrediction(brightness);
-    server.send(200, "text/plain", "Feedback with correction applied");
-  }
-}
-
-void handleManual() {
-  StaticJsonDocument<64> doc;
-  deserializeJson(doc, server.arg("plain"));
-  
-  int brightness = doc["brightness"];
-  setBrightness(brightness);
-  state.actual_brightness = brightness;
-  
-  // Add to learning buffer
-  addToLearningBuffer(
-    state.ambient_light,
-    state.motion_detected,
-    state.hour,
-    state.day_of_week,
-    brightness
-  );
-  
-  server.send(200, "text/plain", "Manual brightness set");
-}
-
-void handleExport() {
-  exportLearningData();
-  
-  File file = SPIFFS.open("/export_training_data.csv", "r");
-  if (!file) {
-    server.send(500, "text/plain", "Export failed");
-    return;
+    prediction_count++;
+    avg_brightness =
+      (avg_brightness * (prediction_count - 1) +
+       final_brightness) /
+      prediction_count;
+    
+    // Print status
+    Serial.print(F("Time: "));
+    Serial.print(hour);
+    Serial.print(F(":"));
+    Serial.print(now.minute());
+    Serial.print(F(" | Ambient: "));
+    Serial.print(smoothed_ldr);
+    Serial.print(F(" | Motion: "));
+    Serial.print(motion_detected);
+    Serial.print(F(" | ML: "));
+    Serial.print(ml_brightness);
+    Serial.print(F("% | Offset: "));
+    Serial.print(manual_offset);
+    Serial.print(F(" | Final: "));
+    Serial.print(final_brightness);
+    Serial.print(F("% | PWM: "));
+    Serial.println(pwm_value);
+    
+    monitorPotForRetraining(current_time, ml_brightness, final_brightness);
+    checkScheduledRetraining(now);
   }
   
-  server.streamFile(file, "text/csv");
-  file.close();
-}
-
-void handleStats() {
-  StaticJsonDocument<256> doc;
-  doc["predictions_made"] = stats.predictions_made;
-  doc["feedbacks_received"] = stats.feedbacks_received;
-  doc["avg_error"] = stats.avg_prediction_error;
-  doc["buffer_count"] = bufferCount;
-  doc["buffer_size"] = LEARNING_BUFFER_SIZE;
-  doc["uptime"] = millis() / 1000;
-  
-  String json;
-  serializeJson(doc, json);
-  server.send(200, "application/json", json);
-}
-
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
-
-void printStatus() {
-  Serial.println("\n========== STATUS REPORT ==========");
-  Serial.printf("Uptime: %lu seconds\n", millis() / 1000);
-  Serial.printf("Predictions Made: %lu\n", stats.predictions_made);
-  Serial.printf("Feedbacks Received: %lu\n", stats.feedbacks_received);
-  Serial.printf("Learning Buffer: %d/%d\n", bufferCount, LEARNING_BUFFER_SIZE);
-  Serial.printf("Average Error: %.2f%%\n", stats.avg_prediction_error);
-  Serial.printf("WiFi Status: %s\n", WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+  // MANUAL MODE: Only potentiometer control, no automatic updates
+  else if (manual_mode) {
+    // In manual mode, LED is controlled directly by potentiometer
+    // No ML predictions, no automatic updates, no retraining
+    manual_offset = readManualOffset();
+    
+    // Map pot value directly to brightness (0-100%)
+    int pot_value = analogRead(POT_PIN);
+    int manual_brightness = map(pot_value, 0, 4095, 0, 100);
+    int pwm_value = map(manual_brightness, 0, 100, 0, 255);
+    ledcWrite(LED_PIN, pwm_value);
+    
+    // Small delay to prevent overwhelming serial output
+    delay(100);
   }
-  Serial.println("==================================\n");
 }
